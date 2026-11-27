@@ -25,8 +25,6 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
 #include "MAX30105.h"
 #include "heartRate.h"
 
@@ -101,7 +99,6 @@ static uint32_t inferenceCount = 0;
 // ------------------------- SENSOR / DISPLAY -------------------------
 static Adafruit_SSD1306 display(128, 64, &Wire, -1);
 static MAX30105 particleSensor;
-static Adafruit_MPU6050 mpu;
 static bool oledReady = false;
 static bool maxReady = false;
 static bool mpuReady = false;
@@ -261,7 +258,7 @@ static void enterState(SystemState nextState) {
             char line2[22];
             char line3[22];
             snprintf(line2, sizeof(line2), "Heart rate: %.0f BPM", acceptedHeartRateBpm);
-            snprintf(line3, sizeof(line3), "MPU6050: SIMULATED");
+            snprintf(line3, sizeof(line3), "Movement confirmed");
             Serial.printf("[DONE] accepted heart rate=%.1f BPM\n", acceptedHeartRateBpm);
             showScreen("WAKE ROUTINE DONE", line2, line3, "Have a good day!");
             break;
@@ -559,59 +556,105 @@ static void updatePulseUi() {
 }
 
 // ------------------------- MPU6050 INITIALIZATION AND ACTIVITY -------------------------
+// MPU6050 register-level driver. This deliberately avoids Adafruit Unified
+// Sensor because its sensor_t typedef conflicts with esp_camera's sensor_t.
+static constexpr uint8_t MPU6050_ADDR_LOW = 0x68;
+static constexpr uint8_t MPU6050_ADDR_HIGH = 0x69;
+static uint8_t mpuAddress = MPU6050_ADDR_LOW;
+
+static bool mpuWriteRegister(uint8_t reg, uint8_t value) {
+    Wire.beginTransmission(mpuAddress);
+    Wire.write(reg);
+    Wire.write(value);
+    return Wire.endTransmission() == 0;
+}
+
+static bool mpuReadRegisters(uint8_t startReg, uint8_t *buffer, size_t length) {
+    Wire.beginTransmission(mpuAddress);
+    Wire.write(startReg);
+    if (Wire.endTransmission(false) != 0) return false;
+
+    const size_t received = Wire.requestFrom((uint8_t)mpuAddress, (uint8_t)length, (uint8_t)true);
+    if (received != length) return false;
+
+    for (size_t i = 0; i < length; ++i) buffer[i] = Wire.read();
+    return true;
+}
+
+static int16_t combineBytes(uint8_t highByte, uint8_t lowByte) {
+    return (int16_t)((uint16_t)highByte << 8 | lowByte);
+}
+
 static bool initMpu6050() {
-    if (!mpu.begin(0x68, &Wire)) {
-        Serial.println("[MPU6050] not found at 0x68; checking 0x69...");
-        if (!mpu.begin(0x69, &Wire)) {
-            Serial.println("[MPU6050] initialization failed at both 0x68 and 0x69");
+    // Check the two standard MPU6050 I2C addresses.
+    mpuAddress = MPU6050_ADDR_LOW;
+    Wire.beginTransmission(mpuAddress);
+    if (Wire.endTransmission() != 0) {
+        mpuAddress = MPU6050_ADDR_HIGH;
+        Wire.beginTransmission(mpuAddress);
+        if (Wire.endTransmission() != 0) {
+            Serial.println("[MPU6050] not detected at 0x68 or 0x69");
             return false;
         }
-        Serial.println("[MPU6050] initialized at 0x69");
-    } else {
-        Serial.println("[MPU6050] initialized at 0x68");
     }
 
-    mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
-    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-    Serial.println("[MPU6050] accel=+/-4g gyro=+/-500deg/s bandwidth=21Hz");
-    return true;
+    // Wake device; select internal 8 MHz oscillator.
+    if (!mpuWriteRegister(0x6B, 0x00)) return false;
+    delay(100);
+
+    // DLPF_CFG=3 (44 Hz accel / 42 Hz gyro), +/-4g, +/-500 degrees/sec.
+    if (!mpuWriteRegister(0x1A, 0x03)) return false;
+    if (!mpuWriteRegister(0x1C, 0x08)) return false;
+    if (!mpuWriteRegister(0x1B, 0x08)) return false;
+    if (!mpuWriteRegister(0x19, 0x04)) return false; // 200 Hz sample rate
+
+    uint8_t whoAmI = 0;
+    if (!mpuReadRegisters(0x75, &whoAmI, 1)) return false;
+    Serial.printf("[MPU6050] detected at 0x%02X, WHO_AM_I=0x%02X\n",
+                  mpuAddress, whoAmI);
+    return (whoAmI == 0x68);
 }
 
 static void pollMpu6050() {
     const uint32_t now = millis();
-    if (lastMpuSampleMs != 0 && now - lastMpuSampleMs < kMpuSampleIntervalMs) {
-        return;
-    }
+    if (lastMpuSampleMs != 0 && now - lastMpuSampleMs < kMpuSampleIntervalMs) return;
 
     const uint32_t elapsedMs = (lastMpuSampleMs == 0)
                                    ? kMpuSampleIntervalMs
                                    : now - lastMpuSampleMs;
     lastMpuSampleMs = now;
 
-    sensors_event_t accelEvent, gyroEvent, tempEvent;
-    mpu.getEvent(&accelEvent, &gyroEvent, &tempEvent);
+    uint8_t raw[14];
+    if (!mpuReadRegisters(0x3B, raw, sizeof(raw))) {
+        Serial.println("[MPU6050] register read failed");
+        movementDetectedThisSample = false;
+        return;
+    }
 
-    const float ax = accelEvent.acceleration.x;
-    const float ay = accelEvent.acceleration.y;
-    const float az = accelEvent.acceleration.z;
+    const int16_t rawAx = combineBytes(raw[0], raw[1]);
+    const int16_t rawAy = combineBytes(raw[2], raw[3]);
+    const int16_t rawAz = combineBytes(raw[4], raw[5]);
+    const int16_t rawGx = combineBytes(raw[8], raw[9]);
+    const int16_t rawGy = combineBytes(raw[10], raw[11]);
+    const int16_t rawGz = combineBytes(raw[12], raw[13]);
+
+    // +/-4g sensitivity = 8192 LSB/g; +/-500 deg/s = 65.5 LSB/(deg/s).
+    const float ax = (rawAx / 8192.0f) * 9.80665f;
+    const float ay = (rawAy / 8192.0f) * 9.80665f;
+    const float az = (rawAz / 8192.0f) * 9.80665f;
+    const float gx = (rawGx / 65.5f) * (PI / 180.0f);
+    const float gy = (rawGy / 65.5f) * (PI / 180.0f);
+    const float gz = (rawGz / 65.5f) * (PI / 180.0f);
+
     const float accelerationMagnitude = sqrtf(ax * ax + ay * ay + az * az);
-
-    // Remove the approximate 1 g gravity component from the acceleration magnitude.
     latestDynamicAcceleration = fabsf(accelerationMagnitude - 9.80665f);
-
-    const float gx = gyroEvent.gyro.x;
-    const float gy = gyroEvent.gyro.y;
-    const float gz = gyroEvent.gyro.z;
     latestGyroMagnitude = sqrtf(gx * gx + gy * gy + gz * gz);
 
     movementDetectedThisSample =
         (latestDynamicAcceleration >= kAccelerationMovementThreshold) ||
         (latestGyroMagnitude >= kGyroMovementThreshold);
 
-    if (movementDetectedThisSample) {
-        accumulatedMovementMs += elapsedMs;
-    }
+    if (movementDetectedThisSample) accumulatedMovementMs += elapsedMs;
 
     Serial.printf("[MPU6050] ax=%.2f ay=%.2f az=%.2f dyn=%.2f m/s2 gyro=%.2f rad/s motion=%s progress=%lu ms\n",
                   ax, ay, az, latestDynamicAcceleration, latestGyroMagnitude,

@@ -612,7 +612,20 @@ static bool initMpu6050() {
     if (!mpuReadRegisters(0x75, &whoAmI, 1)) return false;
     Serial.printf("[MPU6050] detected at 0x%02X, WHO_AM_I=0x%02X\n",
                   mpuAddress, whoAmI);
-    return (whoAmI == 0x68);
+
+    // 0x68 = MPU6050; 0x74 = MPU6515, a closely related 6-axis
+    // device with compatible accel/gyro output registers and scale factors.
+    if (whoAmI == 0x68) {
+        Serial.println("[MPU6050] MPU6050 identity confirmed");
+        return true;
+    }
+    if (whoAmI == 0x74) {
+        Serial.println("[MPU6050] MPU6515-compatible identity detected; using shared accel/gyro register map");
+        return true;
+    }
+
+    Serial.printf("[MPU6050] unsupported WHO_AM_I value: 0x%02X\n", whoAmI);
+    return false;
 }
 
 static void pollMpu6050() {

@@ -107,14 +107,20 @@ static constexpr long kFingerIrThreshold = 50000; // Based on this module's obse
 static constexpr uint32_t kPulseWindowMs = 15000;
 static constexpr uint32_t kFingerLossTimeoutMs = 1500;
 static constexpr int kMinimumValidBpmSamples = 3;
-// MPU6050 activity detection tuning (Adafruit library units: m/s^2 and rad/s).
-// A sample counts as movement if dynamic acceleration OR angular velocity
-// exceeds its threshold. Require 3 seconds of accumulated movement.
-static constexpr uint32_t kMpuSampleIntervalMs = 50;
-static constexpr uint32_t kRequiredMovementMs = 3000;
+// Handheld activity verification: require a sustained, repeatable rhythm.
+// The sensor measures movement patterns, not physiological exertion.
+static constexpr uint32_t kMpuSampleIntervalMs = 20;       // 50 Hz
+static constexpr uint32_t kRequiredMovementMs = 25000;     // 25 seconds
 static constexpr uint32_t kActivityReminderMs = 45000;
-static constexpr float kAccelerationMovementThreshold = 1.2f; // m/s^2
-static constexpr float kGyroMovementThreshold = 0.35f;         // rad/s
+static constexpr uint32_t kRhythmMinIntervalMs = 350;     // about 2.85 Hz max
+static constexpr uint32_t kRhythmMaxIntervalMs = 1200;    // about 0.83 Hz min
+static constexpr uint32_t kRhythmGapTimeoutMs = 1600;
+static constexpr uint32_t kMinimumIntervalsToStart = 4;   // reject isolated shakes
+static constexpr float kLinearPeakThreshold = 0.90f;      // m/s^2
+static constexpr float kLinearResetThreshold = 0.35f;     // hysteresis
+static constexpr float kGyroToLinearFactor = 0.60f;       // rad/s -> activity score
+static constexpr float kGravityFilterAlpha = 0.02f;
+static constexpr float kActivityFilterAlpha = 0.25f;
 static constexpr uint32_t kDoneScreenMs = 12000;
 
 static bool pulseWindowActive = false;
@@ -127,13 +133,22 @@ static float bpmSum = 0.0f;
 static int validBpmSamples = 0;
 static float acceptedHeartRateBpm = 0.0f;
 
-// MPU6050 activity tracking.
+// MPU rhythmic activity tracking.
 static uint32_t lastMpuSampleMs = 0;
+static uint32_t lastValidMpuSampleMs = 0;
 static uint32_t lastActivityDisplayMs = 0;
 static uint32_t accumulatedMovementMs = 0;
 static uint32_t activityStartMs = 0;
+static uint32_t lastRhythmPeakMs = 0;
+static uint32_t rhythmStartMs = 0;
+static uint32_t rhythmIntervalCount = 0;
+static float gravityMagnitudeEstimate = 9.80665f;
+static float filteredActivitySignal = 0.0f;
 static float latestDynamicAcceleration = 0.0f;
 static float latestGyroMagnitude = 0.0f;
+static bool gravityEstimateReady = false;
+static bool activitySignalArmed = true;
+static bool rhythmActive = false;
 static bool movementDetectedThisSample = false;
 
 // ------------------------- STATE MACHINE -------------------------
@@ -209,13 +224,13 @@ static void showActivityScreen() {
     const uint32_t progressSeconds = accumulatedMovementMs / 1000;
     const uint32_t requiredSeconds = kRequiredMovementMs / 1000;
 
-    snprintf(line2, sizeof(line2), "Motion: %s",
-             movementDetectedThisSample ? "DETECTED" : "WAITING");
-    snprintf(line3, sizeof(line3), "Dyn accel: %.1f m/s2", latestDynamicAcceleration);
+    snprintf(line2, sizeof(line2), "Rhythm: %s",
+             rhythmActive ? "ACTIVE" : (movementDetectedThisSample ? "CHECKING" : "WAITING"));
+    snprintf(line3, sizeof(line3), "Signal: %.1f", filteredActivitySignal);
     snprintf(line4, sizeof(line4), "Progress: %lu/%lu sec",
              (unsigned long)progressSeconds, (unsigned long)requiredSeconds);
 
-    showScreen("MOVE TO COMPLETE", line2, line3, line4);
+    showScreen("REPEAT RHYTHMIC MOVE", line2, line3, line4);
 }
 
 static void enterState(SystemState nextState) {
@@ -243,15 +258,24 @@ static void enterState(SystemState nextState) {
             break;
 
         case DETECT_ACTIVITY:
-            Serial.println("[STATE] DETECT_ACTIVITY - real MPU6050 movement monitoring");
+            Serial.println("[STATE] DETECT_ACTIVITY - sustained handheld rhythmic movement verification");
             activityStartMs = millis();
             lastMpuSampleMs = 0;
+            lastValidMpuSampleMs = 0;
             lastActivityDisplayMs = 0;
             accumulatedMovementMs = 0;
+            lastRhythmPeakMs = 0;
+            rhythmStartMs = 0;
+            rhythmIntervalCount = 0;
+            gravityMagnitudeEstimate = 9.80665f;
+            filteredActivitySignal = 0.0f;
             latestDynamicAcceleration = 0.0f;
             latestGyroMagnitude = 0.0f;
+            gravityEstimateReady = false;
+            activitySignalArmed = true;
+            rhythmActive = false;
             movementDetectedThisSample = false;
-            showScreen("ACTIVITY DETECTION", "MPU6050 active", "Please walk/move", "to complete routine");
+            showScreen("ACTIVITY DETECTION", "Hold sensor securely", "Repeat rhythmic moves", "for 25 seconds");
             break;
 
         case ROUTINE_COMPLETE: {
@@ -628,21 +652,35 @@ static bool initMpu6050() {
     return false;
 }
 
+static void resetRhythmProgress(const char *reason) {
+    if (rhythmActive || accumulatedMovementMs > 0) {
+        Serial.printf("[MPU6050] rhythm reset: %s\\n", reason);
+    }
+    accumulatedMovementMs = 0;
+    lastRhythmPeakMs = 0;
+    rhythmStartMs = 0;
+    rhythmIntervalCount = 0;
+    rhythmActive = false;
+    activitySignalArmed = true;
+}
+
 static void pollMpu6050() {
     const uint32_t now = millis();
     if (lastMpuSampleMs != 0 && now - lastMpuSampleMs < kMpuSampleIntervalMs) return;
-
-    const uint32_t elapsedMs = (lastMpuSampleMs == 0)
-                                   ? kMpuSampleIntervalMs
-                                   : now - lastMpuSampleMs;
     lastMpuSampleMs = now;
 
     uint8_t raw[14];
     if (!mpuReadRegisters(0x3B, raw, sizeof(raw))) {
-        Serial.println("[MPU6050] register read failed");
         movementDetectedThisSample = false;
+        if (lastValidMpuSampleMs != 0 &&
+            now - lastValidMpuSampleMs > kRhythmGapTimeoutMs) {
+            resetRhythmProgress("I2C sample gap");
+        }
+        Serial.println("[MPU6050] register read failed; sample ignored");
         return;
     }
+
+    lastValidMpuSampleMs = now;
 
     const int16_t rawAx = combineBytes(raw[0], raw[1]);
     const int16_t rawAy = combineBytes(raw[2], raw[3]);
@@ -651,7 +689,7 @@ static void pollMpu6050() {
     const int16_t rawGy = combineBytes(raw[10], raw[11]);
     const int16_t rawGz = combineBytes(raw[12], raw[13]);
 
-    // +/-4g sensitivity = 8192 LSB/g; +/-500 deg/s = 65.5 LSB/(deg/s).
+    // +/-4g = 8192 LSB/g; +/-500 deg/s = 65.5 LSB/(deg/s).
     const float ax = (rawAx / 8192.0f) * 9.80665f;
     const float ay = (rawAy / 8192.0f) * 9.80665f;
     const float az = (rawAz / 8192.0f) * 9.80665f;
@@ -660,18 +698,78 @@ static void pollMpu6050() {
     const float gz = (rawGz / 65.5f) * (PI / 180.0f);
 
     const float accelerationMagnitude = sqrtf(ax * ax + ay * ay + az * az);
-    latestDynamicAcceleration = fabsf(accelerationMagnitude - 9.80665f);
     latestGyroMagnitude = sqrtf(gx * gx + gy * gy + gz * gz);
 
-    movementDetectedThisSample =
-        (latestDynamicAcceleration >= kAccelerationMovementThreshold) ||
-        (latestGyroMagnitude >= kGyroMovementThreshold);
+    if (!gravityEstimateReady) {
+        gravityMagnitudeEstimate = accelerationMagnitude;
+        gravityEstimateReady = true;
+    } else {
+        gravityMagnitudeEstimate += kGravityFilterAlpha *
+                                    (accelerationMagnitude - gravityMagnitudeEstimate);
+    }
 
-    if (movementDetectedThisSample) accumulatedMovementMs += elapsedMs;
+    // Removing the slowly changing gravity component makes this less sensitive
+    // to how the handheld sensor is oriented.
+    latestDynamicAcceleration = fabsf(accelerationMagnitude - gravityMagnitudeEstimate);
+    const float gyroActivity = latestGyroMagnitude * kGyroToLinearFactor;
+    const float activitySignal = fmaxf(latestDynamicAcceleration, gyroActivity);
+    filteredActivitySignal += kActivityFilterAlpha *
+                              (activitySignal - filteredActivitySignal);
 
-    Serial.printf("[MPU6050] ax=%.2f ay=%.2f az=%.2f dyn=%.2f m/s2 gyro=%.2f rad/s motion=%s progress=%lu ms\n",
-                  ax, ay, az, latestDynamicAcceleration, latestGyroMagnitude,
-                  movementDetectedThisSample ? "YES" : "NO",
+    movementDetectedThisSample = filteredActivitySignal >= kLinearPeakThreshold;
+
+    // A peak is counted only after the signal has first returned below the
+    // lower hysteresis threshold. This prevents one long shake from counting
+    // repeatedly as multiple movement cycles.
+    if (filteredActivitySignal <= kLinearResetThreshold) {
+        activitySignalArmed = true;
+    }
+
+    if (activitySignalArmed && filteredActivitySignal >= kLinearPeakThreshold) {
+        activitySignalArmed = false;
+
+        if (lastRhythmPeakMs == 0) {
+            lastRhythmPeakMs = now;
+            rhythmIntervalCount = 0;
+        } else {
+            const uint32_t interval = now - lastRhythmPeakMs;
+
+            if (interval >= kRhythmMinIntervalMs &&
+                interval <= kRhythmMaxIntervalMs) {
+                lastRhythmPeakMs = now;
+                ++rhythmIntervalCount;
+
+                if (!rhythmActive &&
+                    rhythmIntervalCount >= kMinimumIntervalsToStart) {
+                    rhythmActive = true;
+                    rhythmStartMs = now;
+                    accumulatedMovementMs = 0;
+                    Serial.println("[MPU6050] sustained rhythm confirmed; 25-second timer started");
+                } else if (rhythmActive) {
+                    accumulatedMovementMs = now - rhythmStartMs;
+                }
+            } else {
+                // An early/late peak breaks the cadence. Treat it as the
+                // beginning of a new candidate sequence, not as progress.
+                lastRhythmPeakMs = now;
+                rhythmIntervalCount = 0;
+                rhythmActive = false;
+                accumulatedMovementMs = 0;
+                rhythmStartMs = 0;
+            }
+        }
+    }
+
+    // A missing beat means the user stopped or the cadence was lost.
+    if (lastRhythmPeakMs != 0 &&
+        now - lastRhythmPeakMs > kRhythmGapTimeoutMs) {
+        resetRhythmProgress("rhythmic movement stopped");
+    }
+
+    Serial.printf("[MPU6050] dyn=%.2f gyro=%.2f signal=%.2f rhythm=%s intervals=%lu progress=%lu ms\\n",
+                  latestDynamicAcceleration, latestGyroMagnitude,
+                  filteredActivitySignal, rhythmActive ? "YES" : "NO",
+                  (unsigned long)rhythmIntervalCount,
                   (unsigned long)accumulatedMovementMs);
 }
 

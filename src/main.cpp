@@ -10,12 +10,12 @@
  * 2. Buzzer rings while the camera runs the original person/not-person model.
  * 3. Three consecutive person-positive frames stop the alarm.
  * 4. MAX30102 takes one heart-rate measurement after person detection.
- * 5. An explicitly SIMULATED activity period stands in for the unavailable MPU6050.
- * 6. OLED displays the accepted heart-rate reading and routine-complete status.
+ * 5. MPU6050 monitors real accelerometer and gyroscope movement.
+ * 6. OLED displays heart-rate, live movement status and routine completion.
  *
  * Important limitations:
  * - The model detects person presence, NOT standing posture.
- * - The MPU6050 stage below is simulated; no real movement is measured.
+ * - MPU6050 movement thresholds are configurable and may need calibration for mounting and user movement.
  * - MAX30102 heart-rate values are demonstration estimates, not medical readings.
  * - No RTC is installed: the jumper is a manual alarm-start trigger for the demo.
  */
@@ -25,6 +25,8 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
 #include "MAX30105.h"
 #include "heartRate.h"
 
@@ -99,14 +101,23 @@ static uint32_t inferenceCount = 0;
 // ------------------------- SENSOR / DISPLAY -------------------------
 static Adafruit_SSD1306 display(128, 64, &Wire, -1);
 static MAX30105 particleSensor;
+static Adafruit_MPU6050 mpu;
 static bool oledReady = false;
 static bool maxReady = false;
+static bool mpuReady = false;
 
 static constexpr long kFingerIrThreshold = 50000; // Based on this module's observed readings
 static constexpr uint32_t kPulseWindowMs = 15000;
 static constexpr uint32_t kFingerLossTimeoutMs = 1500;
 static constexpr int kMinimumValidBpmSamples = 3;
-static constexpr uint32_t kActivitySimulationMs = 10000;
+// MPU6050 activity detection tuning (Adafruit library units: m/s^2 and rad/s).
+// A sample counts as movement if dynamic acceleration OR angular velocity
+// exceeds its threshold. Require 3 seconds of accumulated movement.
+static constexpr uint32_t kMpuSampleIntervalMs = 50;
+static constexpr uint32_t kRequiredMovementMs = 3000;
+static constexpr uint32_t kActivityReminderMs = 45000;
+static constexpr float kAccelerationMovementThreshold = 1.2f; // m/s^2
+static constexpr float kGyroMovementThreshold = 0.35f;         // rad/s
 static constexpr uint32_t kDoneScreenMs = 12000;
 
 static bool pulseWindowActive = false;
@@ -119,12 +130,21 @@ static float bpmSum = 0.0f;
 static int validBpmSamples = 0;
 static float acceptedHeartRateBpm = 0.0f;
 
+// MPU6050 activity tracking.
+static uint32_t lastMpuSampleMs = 0;
+static uint32_t lastActivityDisplayMs = 0;
+static uint32_t accumulatedMovementMs = 0;
+static uint32_t activityStartMs = 0;
+static float latestDynamicAcceleration = 0.0f;
+static float latestGyroMagnitude = 0.0f;
+static bool movementDetectedThisSample = false;
+
 // ------------------------- STATE MACHINE -------------------------
 enum SystemState {
     WAITING_FOR_TRIGGER,
     ALARM_RINGING,
     MEASURE_HEART_RATE,
-    SIMULATED_ACTIVITY,
+    DETECT_ACTIVITY,
     ROUTINE_COMPLETE
 };
 
@@ -182,6 +202,25 @@ static void showPulseScreen(const char *heading) {
     showScreen(heading, line2, line3, line4);
 }
 
+static void showActivityScreen() {
+    if (!oledReady) return;
+
+    char line2[22];
+    char line3[22];
+    char line4[22];
+
+    const uint32_t progressSeconds = accumulatedMovementMs / 1000;
+    const uint32_t requiredSeconds = kRequiredMovementMs / 1000;
+
+    snprintf(line2, sizeof(line2), "Motion: %s",
+             movementDetectedThisSample ? "DETECTED" : "WAITING");
+    snprintf(line3, sizeof(line3), "Dyn accel: %.1f m/s2", latestDynamicAcceleration);
+    snprintf(line4, sizeof(line4), "Progress: %lu/%lu sec",
+             (unsigned long)progressSeconds, (unsigned long)requiredSeconds);
+
+    showScreen("MOVE TO COMPLETE", line2, line3, line4);
+}
+
 static void enterState(SystemState nextState) {
     systemState = nextState;
     stateStartMs = millis();
@@ -206,9 +245,16 @@ static void enterState(SystemState nextState) {
             showPulseScreen("MEASURE HEART RATE");
             break;
 
-        case SIMULATED_ACTIVITY:
-            Serial.println("[STATE] SIMULATED_ACTIVITY (MPU6050 is not connected)");
-            showScreen("ACTIVITY SIMULATED", "MPU6050 not connected", "Pretend to walk/move", "10 second demo stage");
+        case DETECT_ACTIVITY:
+            Serial.println("[STATE] DETECT_ACTIVITY - real MPU6050 movement monitoring");
+            activityStartMs = millis();
+            lastMpuSampleMs = 0;
+            lastActivityDisplayMs = 0;
+            accumulatedMovementMs = 0;
+            latestDynamicAcceleration = 0.0f;
+            latestGyroMagnitude = 0.0f;
+            movementDetectedThisSample = false;
+            showScreen("ACTIVITY DETECTION", "MPU6050 active", "Please walk/move", "to complete routine");
             break;
 
         case ROUTINE_COMPLETE: {
@@ -512,6 +558,74 @@ static void updatePulseUi() {
     }
 }
 
+// ------------------------- MPU6050 INITIALIZATION AND ACTIVITY -------------------------
+static bool initMpu6050() {
+    if (!mpu.begin(0x68, &Wire)) {
+        Serial.println("[MPU6050] not found at 0x68; checking 0x69...");
+        if (!mpu.begin(0x69, &Wire)) {
+            Serial.println("[MPU6050] initialization failed at both 0x68 and 0x69");
+            return false;
+        }
+        Serial.println("[MPU6050] initialized at 0x69");
+    } else {
+        Serial.println("[MPU6050] initialized at 0x68");
+    }
+
+    mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+    Serial.println("[MPU6050] accel=+/-4g gyro=+/-500deg/s bandwidth=21Hz");
+    return true;
+}
+
+static void pollMpu6050() {
+    const uint32_t now = millis();
+    if (lastMpuSampleMs != 0 && now - lastMpuSampleMs < kMpuSampleIntervalMs) {
+        return;
+    }
+
+    const uint32_t elapsedMs = (lastMpuSampleMs == 0)
+                                   ? kMpuSampleIntervalMs
+                                   : now - lastMpuSampleMs;
+    lastMpuSampleMs = now;
+
+    sensors_event_t accelEvent, gyroEvent, tempEvent;
+    mpu.getEvent(&accelEvent, &gyroEvent, &tempEvent);
+
+    const float ax = accelEvent.acceleration.x;
+    const float ay = accelEvent.acceleration.y;
+    const float az = accelEvent.acceleration.z;
+    const float accelerationMagnitude = sqrtf(ax * ax + ay * ay + az * az);
+
+    // Remove the approximate 1 g gravity component from the acceleration magnitude.
+    latestDynamicAcceleration = fabsf(accelerationMagnitude - 9.80665f);
+
+    const float gx = gyroEvent.gyro.x;
+    const float gy = gyroEvent.gyro.y;
+    const float gz = gyroEvent.gyro.z;
+    latestGyroMagnitude = sqrtf(gx * gx + gy * gy + gz * gz);
+
+    movementDetectedThisSample =
+        (latestDynamicAcceleration >= kAccelerationMovementThreshold) ||
+        (latestGyroMagnitude >= kGyroMovementThreshold);
+
+    if (movementDetectedThisSample) {
+        accumulatedMovementMs += elapsedMs;
+    }
+
+    Serial.printf("[MPU6050] ax=%.2f ay=%.2f az=%.2f dyn=%.2f m/s2 gyro=%.2f rad/s motion=%s progress=%lu ms\n",
+                  ax, ay, az, latestDynamicAcceleration, latestGyroMagnitude,
+                  movementDetectedThisSample ? "YES" : "NO",
+                  (unsigned long)accumulatedMovementMs);
+}
+
+static void updateActivityDisplay() {
+    if (millis() - lastActivityDisplayMs >= 250) {
+        lastActivityDisplayMs = millis();
+        showActivityScreen();
+    }
+}
+
 // ------------------------- ALARM / TRIGGER -------------------------
 static void stopBuzzer() {
     buzzerIsOn = false;
@@ -585,6 +699,14 @@ void setup() {
     particleSensor.setPulseAmplitudeGreen(0);
     Serial.println("[MAX30102] initialized successfully");
 
+    Serial.println("[MPU6050] initializing...");
+    mpuReady = initMpu6050();
+    if (!mpuReady) {
+        Serial.println("[FATAL] MPU6050 initialization failed");
+        showScreen("MPU6050 ERROR", "Check VCC/GND/SDA/SCL", "Try I2C address", "0x68 or 0x69");
+        while (true) delay(1000);
+    }
+
     if (!initCamera()) {
         Serial.println("[FATAL] Camera initialization failed");
         showScreen("CAMERA ERROR", "Camera init failed");
@@ -626,28 +748,25 @@ void loop() {
             if (pollPulseSensor()) {
                 acceptedHeartRateBpm = bpmSum / static_cast<float>(validBpmSamples);
                 Serial.printf("[PULSE] Accepted heart rate: %.1f BPM\n", acceptedHeartRateBpm);
-                enterState(SIMULATED_ACTIVITY);
+                enterState(DETECT_ACTIVITY);
             } else {
                 updatePulseUi();
             }
             break;
 
-        case SIMULATED_ACTIVITY: {
-            const uint32_t elapsed = millis() - stateStartMs;
-            if (millis() - lastDisplayUpdateMs >= 1000) {
-                lastDisplayUpdateMs = millis();
-                const uint32_t remaining = (elapsed >= kActivitySimulationMs)
-                                               ? 0
-                                               : (kActivitySimulationMs - elapsed + 999) / 1000;
-                char line4[22];
-                snprintf(line4, sizeof(line4), "Continue: %lus", (unsigned long)remaining);
-                showScreen("ACTIVITY SIMULATED", "MPU6050: NOT READ", "Pretend to walk/move", line4);
-            }
-            if (elapsed >= kActivitySimulationMs) {
+        case DETECT_ACTIVITY:
+            pollMpu6050();
+            updateActivityDisplay();
+
+            if (accumulatedMovementMs >= kRequiredMovementMs) {
+                Serial.printf("[MPU6050] activity requirement met: %lu ms accumulated movement\n",
+                              (unsigned long)accumulatedMovementMs);
                 enterState(ROUTINE_COMPLETE);
+            } else if (millis() - activityStartMs >= kActivityReminderMs) {
+                Serial.println("[MPU6050] still waiting for sufficient movement; continuing detection");
+                activityStartMs = millis();
             }
             break;
-        }
 
         case ROUTINE_COMPLETE:
             if (millis() - stateStartMs >= kDoneScreenMs) {
